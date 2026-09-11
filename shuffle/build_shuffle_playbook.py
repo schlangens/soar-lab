@@ -209,6 +209,11 @@ ALLOW_NETS = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", 
               "198.51.100.10/32", "198.51.100.11/32", "100.64.0.7/32"]  # own Linodes, media-server tailnet
 ALLOW_ORGS = ["google", "meta platforms", "facebook", "microsoft", "amazon", "fastly", "cloudflare", "akamai",
               "apple", "linode", "tailscale", "netflix", "edgecast", "level 3", "lumen", "at&t", "comcast"]
+RESIDENTIAL_ORGS = ["charter", "spectrum", "spinco", "rrwe", "road runner", "comcast", "xfinity", "at&t", "sbcis", "sbc internet", "frontier",
+                    "verizon", "cellco", "wirelessdatanetwork", "t-mobile", "tmobile", "metronet", "brightspeed", "cox comm", "windstream",
+                    "centurylink", "mediacom", "altice", "optimum", "suddenlink", "wide open west", "cable one", "sparklight", "google fiber",
+                    "starlink", "us cellular", "altafiber", "cincinnati bell", "tds telecom", "consolidated comm", "rise broadband", "viasat",
+                    "hughes", "ziply", "astound", "wave broadband", "breezeline", "armstrong", "comporium"]
 SCANNER_ORGS = ["censys", "shodan", "stretchoid", "internet measurement", "palo alto networks", "cortex xpanse",
                 "shadowserver", "binaryedge", "onyphe", "leakix", "netsystems research", "alpha strike"]
 reasons, score = [], 0
@@ -255,6 +260,9 @@ elif score >= 40:
     verdict = "escalate"
 else:
     verdict = "escalate" if not e.get("sources_checked") else ("close" if p.get("rule_id") == "100503" and score == 0 and out_of_state else "escalate")
+residential = any(o in org for o in RESIDENTIAL_ORGS)
+if residential and verdict == "block":
+    verdict = "escalate"; reasons.append("residential ISP space (Plex friends live here): never auto-blocked, analyst decides")
 if not p.get("has_ip"):
     verdict = "escalate"; reasons.append("no source ip in alert")
 reason = "; ".join(reasons)[:220].replace('"', "'")
