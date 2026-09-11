@@ -96,4 +96,4 @@ All addresses, hostnames and identifiers in this repository are documentation va
 
 ## Licence
 
-MIT. Built by Scott Schlangen, scottslab.io.
+MIT. Built by Scott Schlangen, soc-lab.io.

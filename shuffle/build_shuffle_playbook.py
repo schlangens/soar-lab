@@ -215,6 +215,8 @@ reasons, score = [], 0
 allow = False
 try:
     ipo = ipaddress.ip_address(ip)
+    if ipo.is_unspecified or ipo.is_multicast or ipo.is_reserved:
+        allow = True; reasons.append("unspecified/multicast/reserved source, not actionable")
     for n in ALLOW_NETS:
         if ipo in ipaddress.ip_network(n, strict=False):
             allow = True; reasons.append("allowlisted range " + n); break
