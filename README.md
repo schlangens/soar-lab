@@ -34,41 +34,63 @@ Full video: https://customer-gb6ix8koycqn490d.cloudflarestream.com/5ab70384b3fc9
 
 ## Repository layout
 
-```
-wazuh/
-  decoders/soar_verdict.xml        decoder for "soar_verdict: action=... srcip=... score=... rule=... reason=..."
-  rules/soar_rules.xml             100530 block (L12), 100531 close (L5), 100532 escalate (L9)
-  rules/pfsense_custom.xml.excerpt the flood rules the pipeline starts from, with the suppressions that keep a torrent swarm out
-  active-response/pfsense-block.sh server-side response: SSH to pfSense, pfctl table add/delete, dedup cache, timeout handling
-  ossec.conf.snippets.txt          the <integration> and <active-response> blocks
-  integrations/                    the skip-list change that prevents verdict loops
-shuffle/
-  build_shuffle_playbook.py        builds the whole "Wazuh Alert Triage" workflow through the Shuffle API (11 nodes)
-n8n/
-  soar-approval-gate.json          token-gated GET webhook that posts a block verdict to Wazuh
-report/
-  soc_report.py                    12 hour SOC report: blocks, verdicts, escalations, IRIS counts, UTC and local time, sent via Resend
-docs/media/                        looping walkthrough GIF and poster frame
+```mermaid
+flowchart LR
+  R[soar-lab]
+  R --> W[wazuh/]
+  W --> W1[decoders/soar_verdict.xml<br/>parses the verdict event]
+  W --> W2[rules/soar_rules.xml<br/>100530 block · 100531 close · 100532 escalate]
+  W --> W3[rules/pfsense_custom.xml.excerpt<br/>flood rules + torrent suppressions]
+  W --> W4[active-response/pfsense-block.sh<br/>pfctl add/delete, dedup, timeout]
+  W --> W5[ossec.conf.snippets.txt<br/>integration + response blocks]
+  W --> W6[integrations/<br/>skip-list change, no verdict loops]
+  R --> S[shuffle/]
+  S --> S1[build_shuffle_playbook.py<br/>builds the 11-node workflow via the API]
+  R --> N[n8n/]
+  N --> N1[soar-approval-gate.json<br/>token-gated approve webhook]
+  R --> P[report/]
+  P --> P1[soc_report.py<br/>12 h SOC report via Resend]
+  R --> D[docs/media/]
+  D --> D1[walkthrough GIF + poster]
 ```
 
 ## How the pieces talk
 
+```mermaid
+flowchart TD
+  PF[pfSense filterlog] --> WZ[Wazuh manager<br/>rule 100503, level 10]
+  WZ -->|integratord webhook| SH[Shuffle · Wazuh Alert Triage]
+  SH --> P1[parse_alert] --> P2[wazuh_auth] --> P3[enrich_ip<br/>RDAP · Tor exits · Spamhaus DROP · Wazuh IOC list · AbuseIPDB · VirusTotal] --> P4[score_verdict<br/>allowlist · out-of-state · residential ISP · weighted score]
+  P4 -->|block| B1[POST /events<br/>soar_verdict action=block]
+  P4 -->|close| C1[POST /events<br/>soar_verdict action=close]
+  P4 -->|escalate| E1[iris_open_alert<br/>Medium · New]
+  B1 --> R530[rule 100530] --> AR[pfsense-block AR<br/>pfctl -t Blocked_IPs -T add · 24 h] --> IB[iris_record_block<br/>High · Closed]
+  C1 --> R531[rule 100531 · audit only]
+  E1 --> MSG[message_analyst<br/>WhatsApp / SMS] --> LOG[log_escalation<br/>rule 100532]
+  SEV[rule 100504<br/>severe flood, fail-safe] --> AR
 ```
-pfSense syslog -> Wazuh (rule 100503, L10) -> integratord -> Shuffle webhook
-                                                      |
-        parse_alert -> wazuh_auth -> enrich_ip -> score_verdict
-                                                      |
-          +-------------------+-------------------+---+---------------------+
-          | block             | close             | escalate                |
-          v                   v                   v                         |
-   POST /events          POST /events        iris_open_alert -> message_analyst -> log_escalation
-   (rule 100530)         (rule 100531)                                (rule 100532)
-          |
-   pfsense-block AR -> pfctl -t Blocked_IPs -T add   (24 h, execd deletes on timeout)
-          |
-   iris_record_block (High, Closed)
 
-analyst -> n8n GET /webhook/soar-approve?t=<token>&ip=&rule=  ->  POST /events (block, score 100)  ->  rule 100530  ->  same response
+### Approval gate
+
+```mermaid
+sequenceDiagram
+  participant A as Analyst
+  participant N as n8n
+  participant W as Wazuh API
+  participant F as pfSense
+  participant I as DFIR-IRIS
+  A->>N: GET /webhook/soar-approve?t=token&ip=src&rule=id
+  N->>N: token equals secret? ip is public unicast?
+  alt check fails
+    N-->>A: 403, no side effects
+  else check passes
+    N->>W: POST /security/user/authenticate (JWT)
+    N->>W: POST /events soar_verdict action=block score=100
+    W->>W: rule 100530 fires
+    W->>F: pfsense-block AR, pfctl add (24 h)
+    W->>I: alert recorded with the approval reason
+    N-->>A: 200 "Block approved"
+  end
 ```
 
 ## Install
