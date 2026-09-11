@@ -1,0 +1,26 @@
+<!-- SOAR verdict rules. 2026-09-11.
+     Shuffle enriches level 10+ alerts and posts a verdict event. 100530 is the ONLY
+     path by which a moderate flood (100503) reaches the pfsense-block response;
+     the severe flood (100504) still blocks directly as a fail-safe.
+     These three ids are in the Shuffle integration skip list to prevent loops. -->
+<group name="soar,">
+  <rule id="100530" level="12">
+    <decoded_as>soar-verdict</decoded_as>
+    <field name="soar_action">^block$</field>
+    <description>SOAR verdict: BLOCK $(srcip) (score $(soar_score), from rule $(soar_rule)) - $(soar_reason)</description>
+    <group>soar_block,attack,</group>
+    <options>no_email_alert</options>
+  </rule>
+  <rule id="100531" level="5">
+    <decoded_as>soar-verdict</decoded_as>
+    <field name="soar_action">^close$</field>
+    <description>SOAR verdict: benign, auto-closed $(srcip) (from rule $(soar_rule)) - $(soar_reason)</description>
+    <group>soar_close,</group>
+  </rule>
+  <rule id="100532" level="9">
+    <decoded_as>soar-verdict</decoded_as>
+    <field name="soar_action">^escalate$</field>
+    <description>SOAR verdict: ESCALATED to analyst $(srcip) (score $(soar_score), from rule $(soar_rule)) - $(soar_reason)</description>
+    <group>soar_escalate,</group>
+  </rule>
+</group>

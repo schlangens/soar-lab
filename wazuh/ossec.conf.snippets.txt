@@ -1,0 +1,21 @@
+210-<!-- Active response: Auto-block attackers on pfSense when flood detected -->
+211-  <active-response>
+212:    <command>pfsense-block</command>
+213-    <location>server</location>
+214-    <!-- 2026-09-11: 100503 (moderate flood) now routes through Shuffle; only the SOAR
+215-         block verdict (100530) and the severe flood (100504, fail-safe) fire directly. -->
+216-    <rules_id>100504, 100530</rules_id>
+217-    <timeout>86400</timeout>
+218-  </active-response>
+219-
+220-<!-- Active response: SSH brute force blocking on Plex server (agent 002) -->
+--
+330-       lower it, or swap to <rule_id>, once the workflow does real triage. -->
+331-  <integration>
+332:    <name>shuffle</name>
+333-    <hook_url>http://10.0.0.30:3001/api/v1/hooks/webhook_<your-webhook-id></hook_url>
+334-    <level>10</level>
+335-    <alert_format>json</alert_format>
+336-  </integration>
+337-
+338-</ossec_config>

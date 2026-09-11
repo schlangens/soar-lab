@@ -1,0 +1,10 @@
+<!-- SOAR verdicts posted back by Shuffle via the Wazuh API (POST /events).
+     Format: soar_verdict: action=block|close|escalate srcip=A.B.C.D score=N rule=NNNNNN reason="free text" -->
+<decoder name="soar-verdict">
+  <prematch>^soar_verdict: </prematch>
+</decoder>
+<decoder name="soar-verdict-fields">
+  <parent>soar-verdict</parent>
+  <regex type="pcre2">action=(\w+) srcip=(\d+\.\d+\.\d+\.\d+) score=(\d+) rule=(\d+) reason="([^"]*)"</regex>
+  <order>soar_action,srcip,soar_score,soar_rule,soar_reason</order>
+</decoder>
