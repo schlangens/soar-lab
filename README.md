@@ -13,7 +13,7 @@ Full video: https://customer-gb6ix8koycqn490d.cloudflarestream.com/5ab70384b3fc9
 | Stage | Component | What happens |
 |---|---|---|
 | 01 Detect | Wazuh | pfSense filterlog is decoded; the moderate flood rule (level 10) posts alert JSON to a Shuffle webhook instead of blocking. A severe flood rule still blocks directly as a fail-safe. |
-| 02 Enrich | Shuffle | RDAP organisation, Tor exit list, Spamhaus DROP, and the lab's own 40k-entry Wazuh IOC list (read through the Wazuh API). AbuseIPDB and VirusTotal are used when keys are present. Feeds are cached for an hour. |
+| 02 Enrich | Shuffle | RDAP organisation, Tor exit list, Spamhaus DROP, FireHOL level1, abuse.ch SSLBL, the lab's own 40k-entry Wazuh IOC list (read through the Wazuh API), Shodan InternetDB and AlienVault OTX (both keyless). AbuseIPDB and VirusTotal are used when keys are present, GreyNoise only when both of those fell away. Every keyed or quota-bound lookup sits behind a per-IP 24 hour cache, a cheap-gate (no lookups for traffic the scorer will close anyway), a per-replica daily budget, a per-minute throttle for VirusTotal, and a 15 minute cooldown after any 429. Skipped lookups are written into the verdict reason as `degraded:` so an escalation shows what it ran without. Bulk feeds are cached for an hour. |
 | 03 Score | Shuffle | Allowlist and an out-of-state check first (source port 80/443 to a high destination port is return traffic, not an attack), then weighted signals to a score. |
 | 04 Act | Wazuh | The verdict is posted back into Wazuh as an event. Three rules turn it into block, close or escalate alerts. Only the block rule is wired to the existing pfSense active response, so timeout, dedup and audit stay in one place. |
 | 05 Record | DFIR-IRIS | Every block and escalation lands as an IRIS alert with the IOC, the enrichment and the Wazuh context. Escalations carry a one-click, token-gated approve link served by n8n and a WhatsApp push to the analyst. |
@@ -98,7 +98,7 @@ sequenceDiagram
 1. **Wazuh manager**: copy `wazuh/decoders/soar_verdict.xml` and `wazuh/rules/soar_rules.xml` into `/var/ossec/etc/{decoders,rules}/`, add the snippets from `wazuh/ossec.conf.snippets.txt` to `ossec.conf` (Shuffle integration at level 10, `pfsense-block` response on your severe flood rule plus 100530), apply the skip-list change in `integrations/shuffle.py`, then `systemctl restart wazuh-manager`. Test with `wazuh-logtest`.
 2. **Shuffle**: log in, note the webhook id of a workflow with a Webhook trigger, set `WF_ID` in `shuffle/build_shuffle_playbook.py`, and run it with your secrets on the command line:
    `python3 build_shuffle_playbook.py wazuh_api_pass=... iris_api_key=... twilio_sid=... twilio_token=... approve_url_base=https://n8n.example/webhook/soar-approve?t=...`
-   Nothing secret is stored in the script. Optional: `abuseipdb_key`, `virustotal_key`.
+   Nothing secret is stored in the script. Optional: `abuseipdb_key`, `virustotal_key`, `greynoise_key`, `otx_key`.
 3. **n8n**: import `n8n/soar-approval-gate.json`, replace `<approve-token>` and the Wazuh Basic header, activate.
 4. **DFIR-IRIS**: any 2.4 instance; the playbook posts to `/alerts/add` with the API key from the workflow variables.
 5. **Report**: `report/soc_report.py` on the manager with a mode-600 env file (`RESEND_KEY`, `IRIS_API_KEY`, `IRIS_URL`, `REPORT_TO`), cron twice a day.

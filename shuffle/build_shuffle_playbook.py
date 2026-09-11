@@ -5,8 +5,10 @@ Graph:
   Webhook (Wazuh integratord, level>=10)
     -> parse_alert   (Shuffle Tools / execute_python)
     -> wazuh_auth    (http POST, raw token)
-    -> enrich_ip     (execute_python: RDAP org, Tor exits, Spamhaus DROP, Wazuh CDB list,
-                      AbuseIPDB + VirusTotal if keys are set)
+    -> enrich_ip     (execute_python: RDAP org, Tor exits, Spamhaus DROP, Wazuh CDB list, FireHOL level1,
+                      abuse.ch SSLBL, Shodan InternetDB, OTX; AbuseIPDB + VirusTotal (+ GreyNoise) when keys are
+                      set, behind a per-IP 24h cache, a cheap-gate, per-replica daily budgets, a VT per-minute
+                      throttle and a 15 min cooldown after any 429)
     -> score_verdict (execute_python: allowlist, out-of-state check, scoring -> block/close/escalate)
     -> [verdict == block]    block_via_wazuh     (http POST /events -> rule 100530 -> pfsense-block AR)
     -> [verdict == close]    auto_close          (http POST /events -> rule 100531, audit only)
@@ -99,18 +101,38 @@ out = {
 print(json.dumps(out))
 '''
 
-ENRICH = r'''
-import json, ipaddress, requests
+LISTS = r'''
+ALLOW_NETS = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
+              "198.41.128.0/17", "172.64.0.0/13",          # Cloudflare
+              "192.200.0.0/24", "199.165.136.0/24", "185.40.234.0/24", "199.38.182.118/32",  # Tailscale ctl/DERP
+              "203.0.113.0/24",                            # Anthropic (Claude Code) per existing AR guard
+              "198.51.100.10/32", "198.51.100.11/32", "100.64.0.7/32"]  # own Linodes, media-server tailnet
+ALLOW_ORGS = ["google", "meta platforms", "facebook", "microsoft", "amazon", "fastly", "cloudflare", "akamai",
+              "apple", "linode", "tailscale", "netflix", "edgecast", "level 3", "lumen", "at&t", "comcast"]
+RESIDENTIAL_ORGS = ["charter", "spectrum", "spinco", "rrwe", "road runner", "comcast", "xfinity", "at&t", "sbcis", "sbc internet", "frontier",
+                    "verizon", "cellco", "wirelessdatanetwork", "t-mobile", "tmobile", "metronet", "brightspeed", "cox comm", "windstream",
+                    "centurylink", "mediacom", "altice", "optimum", "suddenlink", "wide open west", "cable one", "sparklight", "google fiber",
+                    "starlink", "us cellular", "altafiber", "cincinnati bell", "tds telecom", "consolidated comm", "rise broadband", "viasat",
+                    "hughes", "ziply", "astound", "wave broadband", "breezeline", "armstrong", "comporium"]
+SCANNER_ORGS = ["censys", "shodan", "stretchoid", "internet measurement", "palo alto networks", "cortex xpanse",
+                "shadowserver", "binaryedge", "onyphe", "leakix", "netsystems research", "alpha strike"]
+'''
+
+ENRICH_HEAD = r'''
+import json, ipaddress, requests, os, time, hashlib
 requests.packages.urllib3.disable_warnings()
 p = json.loads(r"""$parse_alert.message""")
 ip = p.get("srcip", "")
 token = r"""$wazuh_auth.body""".strip().strip('"')
 abuse_key = r"""$abuseipdb_key""".strip()
 vt_key = r"""$virustotal_key""".strip()
+gn_key = r"""$greynoise_key""".strip()
+otx_key = r"""$otx_key""".strip()
+def keyed(k): return bool(k) and not k.startswith("$")
 e = {"ip": ip, "org": "", "rdap_name": "", "country": "", "tor_exit": False, "spamhaus_drop": False,
      "wazuh_cdb": False, "cdb_source": "", "abuseipdb_confidence": None, "abuseipdb_reports": None,
-     "vt_malicious": None, "sources_checked": [], "errors": []}
-def ok(x): return x is not None and x != ""
+     "vt_malicious": None, "greynoise": None, "internetdb": None, "otx_pulses": None,
+     "sources_checked": [], "skipped": [], "cached": [], "errors": []}
 try:
     ipo = ipaddress.ip_address(ip)
     e["is_private"] = ipo.is_private or ipo.is_loopback or ipo.is_link_local or ipo.is_reserved
@@ -118,9 +140,71 @@ except Exception:
     e["is_private"] = True
     e["errors"].append("bad ip")
     print(json.dumps(e)); raise SystemExit
-import os, time, hashlib
+'''
+
+ENRICH_BODY = r'''
+# ---------------------------------------------------------------------------------------------
+# Quota protection. /tmp persists per Shuffle Tools replica (three replicas run), so every budget
+# below is PER REPLICA and set to roughly a third of the free tier with headroom.
+#   AbuseIPDB free: 1,000 checks/day. VirusTotal public: 4 req/min, 500/day.
+# Order of defence: per-IP result cache (24 h) -> cheap-gate (do not spend quota on traffic the
+# scorer will close anyway) -> daily budget -> per-minute throttle (VT) -> 429 cooldown (15 min).
+# Anything skipped is recorded in e["skipped"] so the verdict reason can say the run was degraded.
+# ---------------------------------------------------------------------------------------------
+BUDGET = {"abuseipdb": 250, "virustotal": 120, "greynoise": 15, "otx": 250, "internetdb": 300}
+VT_PER_MIN = 3
+COOLDOWN = 900
+def _q(name): return "/tmp/q_" + name
+def _read(path, default):
+    try: return open(path).read()
+    except Exception: return default
+def budget_left(src):
+    day = time.strftime("%Y%m%d", time.gmtime())
+    try: n = int(_read(_q(src + "_" + day), "0") or 0)
+    except Exception: n = 0
+    return BUDGET.get(src, 0) - n
+def budget_take(src):
+    day = time.strftime("%Y%m%d", time.gmtime()); path = _q(src + "_" + day)
+    try: n = int(_read(path, "0") or 0)
+    except Exception: n = 0
+    try: open(path, "w").write(str(n + 1))
+    except Exception: pass
+def cooling(src):
+    path = _q(src + "_cooldown")
+    return os.path.exists(path) and time.time() - os.path.getmtime(path) < COOLDOWN
+def cool(src):
+    try: open(_q(src + "_cooldown"), "w").write(str(time.time()))
+    except Exception: pass
+def minute_ok(src, limit):
+    path = _q(src + "_minute"); now = time.time()
+    try: stamps = [float(x) for x in _read(path, "").split() if x]
+    except Exception: stamps = []
+    stamps = [s for s in stamps if now - s < 60]
+    if len(stamps) >= limit: return False
+    stamps.append(now)
+    try: open(path, "w").write(" ".join("%.0f" % s for s in stamps))
+    except Exception: pass
+    return True
+def ip_cache_get(src, ttl=86400):
+    path = _q(src + "_ip_" + hashlib.sha1(ip.encode()).hexdigest()[:16])
+    try:
+        if os.path.exists(path) and time.time() - os.path.getmtime(path) < ttl:
+            return json.loads(open(path).read())
+    except Exception: pass
+    return None
+def ip_cache_put(src, data):
+    path = _q(src + "_ip_" + hashlib.sha1(ip.encode()).hexdigest()[:16])
+    try: open(path, "w").write(json.dumps(data))
+    except Exception: pass
 def get(url, **kw):
     r = requests.get(url, timeout=12, **kw); r.raise_for_status(); return r
+def keyed_get(src, url, **kw):
+    """GET against a quota'd feed. A 429 (or 403 from AbuseIPDB, which it uses for exhausted quota)
+    starts a cooldown so the next runs skip the feed instead of burning the timeout."""
+    r = requests.get(url, timeout=12, **kw)
+    if r.status_code == 429 or (src == "abuseipdb" and r.status_code == 403):
+        cool(src); raise RuntimeError("HTTP %d, cooling %ds" % (r.status_code, COOLDOWN))
+    r.raise_for_status(); return r
 def cached_text(url, ttl=3600, **kw):
     """Fetch a feed at most once per ttl seconds; the Shuffle Tools container persists /tmp between runs."""
     path = "/tmp/feed_" + hashlib.sha1(url.encode()).hexdigest()[:12]
@@ -132,9 +216,29 @@ def cached_text(url, ttl=3600, **kw):
     try: open(path, "w", encoding="utf-8").write(r.text)
     except Exception: pass
     return r.text
-# RDAP: organisation and netname
+def spend(src, fn, per_minute=None):
+    """Run fn() against a quota'd feed only if the cache, budget, throttle and cooldown all allow it."""
+    hit = ip_cache_get(src)
+    if hit is not None:
+        e["cached"].append(src); return hit
+    if cooling(src):
+        e["skipped"].append(src + ": cooling after rate limit"); return None
+    if budget_left(src) <= 0:
+        e["skipped"].append(src + ": daily budget spent"); return None
+    if per_minute and not minute_ok(src, per_minute):
+        e["skipped"].append(src + ": per-minute throttle"); return None
+    budget_take(src)
+    data = fn()
+    ip_cache_put(src, data)
+    return data
+# RDAP: organisation and netname (free, no key, but cache per IP for a day so repeats cost nothing)
 try:
-    d = get("https://rdap.org/ip/" + ip, headers={"Accept": "application/rdap+json"}).json()
+    d = ip_cache_get("rdap")
+    if d is None:
+        d = get("https://rdap.org/ip/" + ip, headers={"Accept": "application/rdap+json"}).json()
+        ip_cache_put("rdap", d)
+    else:
+        e["cached"].append("rdap")
     e["rdap_name"] = d.get("name", "")
     e["country"] = d.get("country", "")
     orgs = []
@@ -175,47 +279,121 @@ try:
     e["sources_checked"].append("wazuh_cdb")
 except Exception as ex:
     e["errors"].append("cdb: " + str(ex)[:80])
-# AbuseIPDB (optional)
-if abuse_key and not abuse_key.startswith("$"):
+# ---------------------------------------------------------------------------------------------
+# Cheap gate. The scorer closes allowlisted ranges and orgs no matter the score, and closes
+# out-of-state return traffic unless a cheap signal already scored it. Neither outcome can change
+# with a reputation lookup, so do not spend quota on them. Mirrors score_verdict exactly.
+# ---------------------------------------------------------------------------------------------
+cheap_close = e["is_private"]
+try:
+    for n in ALLOW_NETS:
+        if ipo in ipaddress.ip_network(n, strict=False): cheap_close = True; break
+except Exception:
+    cheap_close = True
+org_l = (e.get("org") or "").lower() + " " + (e.get("rdap_name") or "").lower()
+if any(o in org_l for o in ALLOW_ORGS): cheap_close = True
+try:
+    sp, dp = int(p.get("srcport") or 0), int(p.get("dstport") or 0)
+except Exception:
+    sp, dp = 0, 0
+cheap_signal = e["tor_exit"] or e["spamhaus_drop"] or e["wazuh_cdb"] or any(o in org_l for o in SCANNER_ORGS)
+if sp in (80, 443, 8443) and dp >= 1024 and not cheap_signal: cheap_close = True
+e["cheap_close"] = cheap_close
+if cheap_close:
+    e["skipped"].append("reputation lookups: not needed, cheap checks already close this")
+else:
+    # AbuseIPDB (keyed, budgeted)
+    if keyed(abuse_key):
+        try:
+            d = spend("abuseipdb", lambda: keyed_get("abuseipdb", "https://api.abuseipdb.com/api/v2/check",
+                      params={"ipAddress": ip, "maxAgeInDays": 90},
+                      headers={"Key": abuse_key, "Accept": "application/json"}).json().get("data", {}))
+            if d is not None:
+                e["abuseipdb_confidence"] = d.get("abuseConfidenceScore"); e["abuseipdb_reports"] = d.get("totalReports")
+                e["sources_checked"].append("abuseipdb")
+        except Exception as ex:
+            e["errors"].append("abuseipdb: " + str(ex)[:80])
+    # VirusTotal (keyed, budgeted, throttled to VT_PER_MIN)
+    if keyed(vt_key):
+        try:
+            d = spend("virustotal", lambda: keyed_get("virustotal", "https://www.virustotal.com/api/v3/ip_addresses/" + ip,
+                      headers={"x-apikey": vt_key}).json(), per_minute=VT_PER_MIN)
+            if d is not None:
+                e["vt_malicious"] = d.get("data", {}).get("attributes", {}).get("last_analysis_stats", {}).get("malicious")
+                e["sources_checked"].append("virustotal")
+        except Exception as ex:
+            e["errors"].append("vt: " + str(ex)[:80])
+    # ---- fallbacks: keyless or generous feeds so a rate-limited day still scores ----------------
+    # Shodan InternetDB: keyless, ~600-request bursts before a 429, weekly data. Open ports, CVEs, tags.
     try:
-        d = get("https://api.abuseipdb.com/api/v2/check", params={"ipAddress": ip, "maxAgeInDays": 90},
-                headers={"Key": abuse_key, "Accept": "application/json"}).json().get("data", {})
-        e["abuseipdb_confidence"] = d.get("abuseConfidenceScore"); e["abuseipdb_reports"] = d.get("totalReports")
-        e["sources_checked"].append("abuseipdb")
+        def _idb():
+            r = requests.get("https://internetdb.shodan.io/" + ip, timeout=12)
+            if r.status_code == 404: return {}
+            if r.status_code == 429: cool("internetdb"); raise RuntimeError("HTTP 429, cooling %ds" % COOLDOWN)
+            r.raise_for_status(); return r.json()
+        d = spend("internetdb", _idb)
+        if d is not None:
+            e["internetdb"] = {"ports": len(d.get("ports") or []), "vulns": len(d.get("vulns") or []), "tags": d.get("tags") or []}
+            e["sources_checked"].append("internetdb")
     except Exception as ex:
-        e["errors"].append("abuseipdb: " + str(ex)[:80])
-# VirusTotal (optional)
-if vt_key and not vt_key.startswith("$"):
+        e["errors"].append("internetdb: " + str(ex)[:80])
+    # AlienVault OTX general endpoint: pulse count. Works without a key at a lower rate; a free key raises it.
     try:
-        d = get("https://www.virustotal.com/api/v3/ip_addresses/" + ip, headers={"x-apikey": vt_key}).json()
-        e["vt_malicious"] = d.get("data", {}).get("attributes", {}).get("last_analysis_stats", {}).get("malicious")
-        e["sources_checked"].append("virustotal")
+        def _otx():
+            h = {"X-OTX-API-KEY": otx_key} if keyed(otx_key) else {}
+            r = requests.get("https://otx.alienvault.com/api/v1/indicators/IPv4/" + ip + "/general", headers=h, timeout=8)
+            if r.status_code == 429: cool("otx"); raise RuntimeError("HTTP 429, cooling %ds" % COOLDOWN)
+            r.raise_for_status(); return r.json()
+        d = spend("otx", _otx)
+        if d is not None:
+            e["otx_pulses"] = (d.get("pulse_info") or {}).get("count")
+            e["sources_checked"].append("otx")
     except Exception as ex:
-        e["errors"].append("vt: " + str(ex)[:80])
+        e["errors"].append("otx: " + str(ex)[:80])
+    # GreyNoise Community: 50 lookups a week on the free key, so only when the two primary feeds both fell away.
+    primary_missing = ("abuseipdb" not in e["sources_checked"] and "abuseipdb" not in e["cached"]) and ("virustotal" not in e["sources_checked"] and "virustotal" not in e["cached"])
+    if keyed(gn_key) and primary_missing:
+        try:
+            def _gn():
+                r = requests.get("https://api.greynoise.io/v3/community/" + ip, headers={"key": gn_key}, timeout=12)
+                if r.status_code == 404: return {"classification": "unknown"}
+                if r.status_code == 429: cool("greynoise"); raise RuntimeError("HTTP 429, cooling %ds" % COOLDOWN)
+                r.raise_for_status(); return r.json()
+            d = spend("greynoise", _gn)
+            if d is not None:
+                e["greynoise"] = {"classification": d.get("classification"), "noise": d.get("noise"), "riot": d.get("riot"), "name": d.get("name")}
+                e["sources_checked"].append("greynoise")
+        except Exception as ex:
+            e["errors"].append("greynoise: " + str(ex)[:80])
+# ---- bulk lists, always on, cached like Spamhaus DROP: FireHOL level1 and abuse.ch SSLBL C2 IPs -------------
+e["firehol_level1"] = False; e["sslbl_c2"] = False
+try:
+    nets = [l.strip() for l in cached_text("https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/firehol_level1.netset", ttl=3600).splitlines() if l and not l.startswith("#")]
+    e["firehol_level1"] = any(ipo in ipaddress.ip_network(n, strict=False) for n in nets if n)
+    e["sources_checked"].append("firehol_level1")
+except Exception as ex:
+    e["errors"].append("firehol: " + str(ex)[:80])
+try:
+    c2 = set(l.strip() for l in cached_text("https://sslbl.abuse.ch/blacklist/sslipblacklist.txt", ttl=3600).splitlines() if l and not l.startswith("#"))
+    e["sslbl_c2"] = ip in c2
+    e["sources_checked"].append("sslbl")
+except Exception as ex:
+    e["errors"].append("sslbl: " + str(ex)[:80])
 print(json.dumps(e))
 '''
 
-SCORE = r'''
+ENRICH = ENRICH_HEAD + LISTS + ENRICH_BODY
+
+SCORE_HEAD = r'''
 import json, ipaddress
 p = json.loads(r"""$parse_alert.message""")
 e = json.loads(r"""$enrich_ip.message""")
 ip = p.get("srcip", "")
 approve_base = r"""$approve_url_base""".strip()
 # --- allowlist: never act on these, whatever the score says -------------------------------
-ALLOW_NETS = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
-              "198.41.128.0/17", "172.64.0.0/13",          # Cloudflare
-              "192.200.0.0/24", "199.165.136.0/24", "185.40.234.0/24", "199.38.182.118/32",  # Tailscale ctl/DERP
-              "203.0.113.0/24",                            # Anthropic (Claude Code) per existing AR guard
-              "198.51.100.10/32", "198.51.100.11/32", "100.64.0.7/32"]  # own Linodes, media-server tailnet
-ALLOW_ORGS = ["google", "meta platforms", "facebook", "microsoft", "amazon", "fastly", "cloudflare", "akamai",
-              "apple", "linode", "tailscale", "netflix", "edgecast", "level 3", "lumen", "at&t", "comcast"]
-RESIDENTIAL_ORGS = ["charter", "spectrum", "spinco", "rrwe", "road runner", "comcast", "xfinity", "at&t", "sbcis", "sbc internet", "frontier",
-                    "verizon", "cellco", "wirelessdatanetwork", "t-mobile", "tmobile", "metronet", "brightspeed", "cox comm", "windstream",
-                    "centurylink", "mediacom", "altice", "optimum", "suddenlink", "wide open west", "cable one", "sparklight", "google fiber",
-                    "starlink", "us cellular", "altafiber", "cincinnati bell", "tds telecom", "consolidated comm", "rise broadband", "viasat",
-                    "hughes", "ziply", "astound", "wave broadband", "breezeline", "armstrong", "comporium"]
-SCANNER_ORGS = ["censys", "shodan", "stretchoid", "internet measurement", "palo alto networks", "cortex xpanse",
-                "shadowserver", "binaryedge", "onyphe", "leakix", "netsystems research", "alpha strike"]
+'''
+
+SCORE_BODY = r'''
 reasons, score = [], 0
 allow = False
 try:
@@ -249,6 +427,24 @@ if isinstance(ac, int):
 vt = e.get("vt_malicious")
 if isinstance(vt, int) and vt > 0:
     score += min(vt * 20, 60); reasons.append("VirusTotal malicious votes %d" % vt)
+# --- fallback signals (keyless feeds and bulk lists) -----------------------------------------
+if e.get("firehol_level1"): score += 40; reasons.append("on FireHOL level1")
+if e.get("sslbl_c2"):       score += 60; reasons.append("abuse.ch SSLBL C2 address")
+idb = e.get("internetdb") or {}
+if idb:
+    risky = sorted(set(t.lower() for t in (idb.get("tags") or [])) & {"tor", "proxy", "vpn", "c2", "malware", "compromised", "honeypot"})
+    if risky: score += 20; reasons.append("InternetDB tags: " + ",".join(risky))
+    if (idb.get("vulns") or 0) >= 3: score += 15; reasons.append("InternetDB: %d known CVEs exposed" % idb["vulns"])
+otx = e.get("otx_pulses")
+if isinstance(otx, int) and otx >= 5: score += 30; reasons.append("OTX pulses %d" % otx)
+elif isinstance(otx, int) and otx >= 1: score += 15; reasons.append("OTX pulses %d" % otx)
+gn = e.get("greynoise") or {}
+if gn.get("classification") == "malicious": score += 50; reasons.append("GreyNoise malicious")
+elif gn.get("riot") or gn.get("classification") == "benign":
+    score -= 40; reasons.append("GreyNoise benign/RIOT: " + str(gn.get("name") or "")[:30])
+score = max(score, 0)
+quota_skips = [x for x in e.get("skipped", []) if "budget" in x or "throttle" in x or "cooling" in x]
+if quota_skips: reasons.append("degraded: " + "; ".join(quota_skips)[:90])
 # --- verdict -------------------------------------------------------------------------------
 if allow:
     verdict = "close"
@@ -294,7 +490,9 @@ iris_body = {"alert_title": "SOAR %s: %s (%s)" % (verdict.upper(), ip, (e.get("r
              "alert_tags": "soar,%s,rule-%s" % (verdict, p.get("rule_id")),
              "alert_context": {"srcip": ip, "score": min(score, 100), "verdict": verdict, "wazuh_rule": p.get("rule_id"), "org": e.get("org"),
                                "tor_exit": e.get("tor_exit"), "spamhaus_drop": e.get("spamhaus_drop"), "wazuh_cdb": e.get("wazuh_cdb"),
-                               "abuseipdb_confidence": e.get("abuseipdb_confidence"), "vt_malicious": e.get("vt_malicious")},
+                               "abuseipdb_confidence": e.get("abuseipdb_confidence"), "vt_malicious": e.get("vt_malicious"),
+                               "firehol_level1": e.get("firehol_level1"), "sslbl_c2": e.get("sslbl_c2"), "internetdb": e.get("internetdb"),
+                               "otx_pulses": e.get("otx_pulses"), "greynoise": e.get("greynoise"), "skipped": e.get("skipped"), "cached": e.get("cached")},
              "alert_source_content": {"wazuh_alert_id": p.get("alert_id"), "timestamp": p.get("timestamp"), "description": p.get("rule_desc")},
              "alert_iocs": [{"ioc_value": ip, "ioc_type_id": 79, "ioc_description": "flood source (" + verdict + ")", "ioc_tlp_id": 2, "ioc_tags": "soar"}] if p.get("has_ip") else []}
 import re as _re
@@ -318,6 +516,8 @@ print(json.dumps({"verdict": verdict, "score": min(score, 100), "reason": reason
                   "summary": summary, "srcip": ip, "approve_url": approve, "iris_body": iris_body, "spoken": spoken, "twiml": twiml,
                   "twilio_msg_form": twilio_msg_form, "twilio_call_form": twilio_call_form}))
 '''
+
+SCORE = SCORE_HEAD + LISTS + SCORE_BODY
 
 WAZUH = "https://10.0.0.20:55000"
 n_parse  = action("tools", "execute_python", "parse_alert", {"code": PARSE.strip()}, 420, 200)
@@ -368,7 +568,7 @@ wf["branches"] = [
     branch(n_iris_esc["id"], n_wa["id"]),
 ]
 wf["visual_branches"] = []
-wf["description"] = ("Wazuh level 10+ alert -> parse -> enrich (RDAP, Tor, Spamhaus DROP, Wazuh CDB, AbuseIPDB/VT optional) "
+wf["description"] = ("Wazuh level 10+ alert -> parse -> enrich (RDAP, Tor, Spamhaus DROP, Wazuh CDB, FireHOL L1, SSLBL, InternetDB, OTX; AbuseIPDB/VT/GreyNoise keyed and quota-protected) "
                      "-> allowlist + score -> block (Wazuh rule 100530 -> pfsense-block AR, 24h), close (100531 audit) "
                      "or escalate (Telegram + 100532). Built 2026-09-11.")
 existing = {v["name"]: v for v in (wf.get("workflow_variables") or [])}
@@ -378,9 +578,11 @@ def var(name, value, desc):
     return v
 wf["workflow_variables"] = [
     var("wazuh_api_user", "wazuh-wui", "Wazuh API user"),
-    var("wazuh_api_pass", "", "Wazuh API password"),
+    var("wazuh_api_pass", "", "Wazuh API password (pass wazuh_api_pass=... on the command line)"),
     var("abuseipdb_key", "", "AbuseIPDB API key (optional; blank = skipped)"),
     var("virustotal_key", "", "VirusTotal API key (optional; blank = skipped)"),
+    var("greynoise_key", "", "GreyNoise Community API key (optional; only used when AbuseIPDB and VT both fell away)"),
+    var("otx_key", "", "AlienVault OTX API key (optional; raises the OTX rate limit)"),
     var("telegram_bot_token", "", "Telegram bot token for analyst escalation"),
     var("telegram_chat_id", "", "Telegram chat id for analyst escalation"),
     var("approve_url_base", "", "n8n approval webhook base URL (optional)"),
